@@ -352,6 +352,7 @@ def analyze_diff_with_llm(
 
         # Prepare the prompt - modified to be more direct
         user_prompt = f"""Analyze this git diff for file '{filename}' and list the changes:
+
         {diff_content}
         """
 
