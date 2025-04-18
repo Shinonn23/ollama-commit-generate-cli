@@ -1,563 +1,355 @@
-import os
+# Standard Library Imports
 import sys
-import subprocess
 import argparse
-import shutil
-import requests
-import io
-import locale
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional, Tuple, Dict, Any
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.markdown import Markdown
-from rich.prompt import Prompt
-from rich import print as rprint
+import json  # Import json for config file handling
+import os  # Import os for path handling and directory creation
+from typing import Optional, Dict, Any  # Import types for clarity
 
-BASE_URL = "http://localhost:11434/api"
+# Third-Party Library Imports
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt, Confirm  # Import Confirm for yes/no prompts
+from rich import print as rprint  # Use rich.print for consistent styling
+from rich.text import Text  # Import Text for styled strings
+
+# Internal Module Imports (assuming these exist and work as intended)
+from _engine.ollama import get_models, display_models, select_model
+from _engine.git import get_latest_commit_hash, analyze_git_changes
+from _data.ollama import SYSTEM_PROMPT  # Assuming SYSTEM_PROMPT is a string constant
+
+# --- Configuration ---
+# Define the path for the default model configuration file
+DEFAULT_CONFIG_DIR = "_data"
+DEFAULT_CONFIG_FILE = os.path.join(DEFAULT_CONFIG_DIR, "default.json")
+
+# --- Initialize Rich Console ---
+# Create a global console instance
 console = Console()
 
-# =============== Git Diff Engine Functions ===============
+
+# --- Configuration File Management Functions ---
 
 
-def run_command(command: str) -> str:
+def load_default_model() -> Optional[str]:
     """
-    Run a shell command and return its output as a string.
-
-    Args:
-        command (str): The shell command to execute
+    Loads the default Ollama model name from the configuration file.
 
     Returns:
-        str: The stripped stdout output of the command if successful,
-             or an empty string if the command fails
+        Optional[str]: The default model name string if found and readable,
+                       otherwise returns None.
     """
-    try:
-        # Using UTF-8 encoding to handle special characters in diff output
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=True,
-            text=True,
-            encoding="utf-8",  # Explicitly use UTF-8 instead of system default
-            errors="replace",  # Replace invalid characters rather than failing
-            check=False,
-        )
-        if result.returncode != 0:
-            console.print(
-                f"[yellow]Warning: Command returned non-zero exit code: {command}"
-            )
-            console.print(f"[red]Error: {result.stderr}")
-            return ""
-        return result.stdout.strip() if result.stdout else ""
-    except Exception as e:
-        console.print(f"[red]Error executing command: {command}")
-        console.print(f"[red]Exception: {str(e)}")
-        return ""
-
-
-def get_latest_commit_hash() -> str:
-    """
-    Get the latest commit hash from the git repository.
-
-    Returns:
-        str: The SHA-1 hash of the most recent commit in the current branch.
-             Returns an empty string if the command fails.
-    """
-    return run_command("git rev-parse HEAD")
-
-
-def get_changed_files(commit_hash: Optional[str] = None) -> List[str]:
-    """
-    Get list of files changed in the commit or latest uncommitted changes.
-
-    Args:
-        commit_hash (Optional[str], optional): The commit hash to get changes for.
-            If None, returns uncommitted changes. Defaults to None.
-
-    Returns:
-        List[str]: A list of file paths that were changed in the specified commit
-            or in the current working directory if no commit is specified.
-            Empty strings are filtered out.
-    """
-    if commit_hash:
-        # For a specific commit
-        files = run_command(f"git diff --name-only {commit_hash}^ {commit_hash}")
-        return [f for f in files.split("\n") if f]
-    else:
-        # For uncommitted changes
-        staged = run_command("git diff --name-only --staged")
-        unstaged = run_command("git diff --name-only")
-
-        # Combine and remove duplicates
-        staged_files = [f for f in staged.split("\n") if f]
-        unstaged_files = [f for f in unstaged.split("\n") if f]
-
-        all_files = set(staged_files + unstaged_files)
-        return list(all_files)
-
-
-def save_diff_for_file(file_info: Tuple[str, str, str]) -> str:
-    """
-    Save the diff for a specific file to the output directory.
-
-    Args:
-        file_info (Tuple[str, str, str]): A tuple containing:
-            - file_path (str): Path to the file to generate diff for
-            - output_dir (str): Directory where the diff file will be saved
-            - commit_hash (str, optional): Commit hash to generate diff against.
-                                         If None, generates diff for uncommitted changes.
-
-    Returns:
-        str: Path to the saved diff file, or empty string if no diff was saved
-    """
-    file_path, output_dir, commit_hash = file_info
-
-    if not file_path:
-        return ""
-
-    # Create a safe filename
-    safe_filename = file_path.replace("/", "__").replace("\\", "__")
-
-    # Generate diff command based on whether we have a commit hash
-    if commit_hash:
-        diff_command = f'git diff {commit_hash}^ {commit_hash} -- "{file_path}"'
-    else:
-        # Check if file is staged
-        is_staged = file_path in run_command("git diff --name-only --staged").split(
-            "\n"
-        )
-        if is_staged:
-            diff_command = f'git diff --staged -- "{file_path}"'
-        else:
-            diff_command = f'git diff -- "{file_path}"'
-
-    diff_content = run_command(diff_command)
-
-    if not diff_content:
-        console.print(f"[yellow]No changes found for: {file_path}")
-        return ""
-
-    output_path = os.path.join(output_dir, f"{safe_filename}_diff.txt")
-
-    try:
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(diff_content)
-        console.print(
-            f"[green]Saved diff for: [bold]{file_path}[/bold] → {output_path}"
-        )
-        return output_path
-    except Exception as e:
-        console.print(f"[red]Error saving diff for {file_path}: {str(e)}")
-        return ""
-
-
-def clear_directory(directory: str) -> None:
-    """
-    Clear all files in the specified directory without removing the directory itself.
-
-    Args:
-        directory (str): Path to the directory to clear
-
-    Returns:
-        None
-    """
-    if os.path.exists(directory):
-        console.print(f"[yellow]Clearing files in {directory}...")
-        for filename in os.listdir(directory):
-            file_path = os.path.join(directory, filename)
-            try:
-                if os.path.isfile(file_path):
-                    os.unlink(file_path)
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)
-            except Exception as e:
-                console.print(f"[red]Error removing {file_path}: {e}")
-
-
-def export_git_diffs(
-    commit_hash: Optional[str] = None,
-    output_dir: str = "temp_diffs",
-    max_workers: int = 4,
-) -> List[str]:
-    """
-    Export diffs for all changed files in parallel.
-
-    Args:
-        commit_hash (Optional[str], optional): The commit hash to get changes for.
-            If None, exports diffs for uncommitted changes. Defaults to None.
-        output_dir (str, optional): Directory where diff files will be saved.
-            Defaults to "temp_diffs".
-        max_workers (int, optional): Number of parallel threads to use for
-            processing diffs. Defaults to 4.
-
-    Returns:
-        List[str]: List of paths to saved diff files
-    """
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Clear existing files in the output directory
-    clear_directory(output_dir)
-
-    # If no commit hash provided, use the latest changes
-    commit_desc = f"commit: {commit_hash}" if commit_hash else "uncommitted changes"
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn(f"[bold blue]Exporting diffs for {commit_desc}..."),
-        transient=False,
-    ) as progress:
-        task = progress.add_task("", total=None)
-
-        # Get changed files
-        files = get_changed_files(commit_hash)
-
-        if not files:
-            progress.stop()
-            console.print("[yellow]No changed files found!")
-            return []
-
-        progress.update(
-            task, description=f"[bold blue]Found {len(files)} changed file(s)..."
-        )
-
-        # Prepare arguments for parallel processing
-        file_infos = [(file_path, output_dir, commit_hash) for file_path in files]
-
-        # Process files in parallel
-        diff_files = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for i, result in enumerate(executor.map(save_diff_for_file, file_infos)):
-                if result:
-                    diff_files.append(result)
-                progress.update(
-                    task,
-                    description=f"[bold blue]Processing file {i+1}/{len(files)}...",
-                )
-
-        progress.update(
-            task,
-            description=f"[bold green]All diffs exported ({len(diff_files)}/{len(files)} files)",
-        )
-
-    console.print(f"[bold green]All diffs exported to {os.path.abspath(output_dir)}")
-    return diff_files
-
-
-# =============== Ollama Functions ===============
-
-
-def get_models() -> list:
-    """Get all available models on the system"""
-    try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]Loading models..."),
-            transient=True,
-        ) as progress:
-            progress.add_task("", total=None)
-            response = requests.get(f"{BASE_URL}/tags")
-
-        if response.status_code == 200:
-            return response.json().get("models", [])
-        else:
-            console.print(f"[bold red]Error: {response.status_code}")
-            return []
-    except requests.exceptions.ConnectionError:
-        console.print("[bold red]Unable to connect to Ollama server")
-        console.print(
-            "[yellow]Please check if Ollama is running at http://localhost:11434"
-        )
-        return []
-
-
-def display_models(models) -> None:
-    """Display models in table format"""
-    if not models:
-        console.print(
-            Panel(
-                "[italic yellow]No models installed on the system",
-                title="[bold red]Warning",
-                border_style="red",
-            )
-        )
-        return
-
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("No.", style="dim", width=6, justify="center")
-    table.add_column("Model Name", style="cyan", min_width=20)
-    table.add_column("Size", style="green", justify="right")
-    table.add_column("Tags", style="yellow")
-
-    for i, model in enumerate(models, 1):
-        name = model.get("name", "")
-        size = f"{model.get('size', 0) / 1_000_000_000:.2f} GB"
-        tags = ", ".join(model.get("tags", []))
-        table.add_row(str(i), name, size, tags)
-
-    console.print(
-        Panel(table, title="[bold cyan]Installed Models", border_style="cyan")
-    )
-
-
-def select_model(models) -> str | None:
-    """Let the user select a model"""
-    if not models:
-        return None
-
-    console.print("\n[bold yellow]Please select a model (enter number or 'q' to quit):")
-    choice = console.input("[bold cyan]>>> ")
-
-    if choice.lower() == "q":
+    if not os.path.exists(DEFAULT_CONFIG_FILE):
+        # rprint(f"[dim]Config file not found: {DEFAULT_CONFIG_FILE}[/dim]") # Optional: verbose log
         return None
 
     try:
-        index = int(choice) - 1
-        if 0 <= index < len(models):
-            return models[index]["name"]
-        else:
-            console.print("[bold red]Invalid number")
-            return select_model(models)
-    except ValueError:
-        console.print("[bold red]Please enter a valid number")
-        return select_model(models)
+        with open(DEFAULT_CONFIG_FILE, "r", encoding="utf-8") as f:
+            config: Dict[str, Any] = json.load(f)
+            model_name = config.get("default_ollama_model")
+            if isinstance(model_name, str) and model_name:
+                # rprint(f"[dim]Loaded default model from config: {model_name}[/dim]") # Optional: verbose log
+                return model_name
+            else:
+                rprint(
+                    f"[warning]Config file '{DEFAULT_CONFIG_FILE}' does not contain a valid 'default_ollama_model' key.[/warning]"
+                )
+                return None
+    except json.JSONDecodeError:
+        rprint(
+            f"[error]Error decoding JSON from config file: {DEFAULT_CONFIG_FILE}. File might be corrupted.[/error]"
+        )
+        return None
+    except Exception as e:
+        rprint(
+            f"[error]Unexpected error reading config file {DEFAULT_CONFIG_FILE}: {e}[/error]"
+        )
+        return None
 
 
-def analyze_diff_with_llm(
-    model_name: str, diff_file: str, system_prompt: str = None
-) -> str:
+def save_default_model(model_name: str) -> None:
     """
-    Analyze a diff file using the selected LLM model and display the result directly
+    Saves the given model name as the default in the configuration file.
 
     Args:
-        model_name (str): Name of the Ollama model to use
-        diff_file (str): Path to the diff file to analyze
-        system_prompt (str, optional): System prompt to provide context
-
-    Returns:
-        str: The LLM's analysis of changes in the diff file
+        model_name (str): The Ollama model name to save as default.
     """
     try:
-        # Read the diff file
-        with open(diff_file, "r", encoding="utf-8", errors="replace") as f:
-            diff_content = f.read()
+        # Ensure the data directory exists
+        os.makedirs(DEFAULT_CONFIG_DIR, exist_ok=True)
 
-        # Extract the original filename from the diff filename
-        filename = (
-            os.path.basename(diff_file).replace("_diff.txt", "").replace("__", "/")
+        config_data = {"default_ollama_model": model_name}
+
+        with open(DEFAULT_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, indent=4)
+
+        rprint(
+            f"[bold green]✔[/bold green] Default model '[cyan]{model_name}[/cyan]' saved to [dim]{DEFAULT_CONFIG_FILE}[/dim]"
         )
-
-        # Prepare the prompt - modified to be more direct
-        user_prompt = f"""Analyze this git diff for file '{filename}' and list the changes:
-
-        {diff_content}
-        """
-
-        # Use a more direct system prompt
-        if system_prompt is None:
-            system_prompt = """
-            Analyze the following Python diff. Only summarize the key components and workflow of the script, and highlight any notable implementation details or potential issues. Use the following structure only:
-
-            Key Components and Workflow
-            [bullet points about how the script works]
-
-            Identified Issues and Solutions
-            [bullet points with observations and notes]
-
-            Keep the explanation focused and concise. Do not provide any conclusion or general commentary.
-
-            ```diff
-            [INSERT DIFF HERE]  
-            ```
-            """
-
-        data = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "stream": False,
-        }
-
-        console.print(f"[bold blue]Analyzing: {filename}...")
-
-        response = requests.post(f"{BASE_URL}/chat", json=data)
-
-        if response.status_code == 200:
-            result = response.json()
-            analysis = result.get("message", {}).get("content", "No analysis available")
-
-            # Display the result directly
-            console.print("\n")
-            console.print(
-                Panel(
-                    Markdown(analysis),
-                    title=f"[bold green]Analysis of {filename}",
-                    border_style="green",
-                    width=100,
-                )
-            )
-            console.print(f"[green]✓ Analysis completed for: [bold]{filename}")
-            return analysis
-        else:
-            error_msg = f"Error ({response.status_code}) analyzing {filename}"
-            console.print(f"[bold red]{error_msg}")
-            return error_msg
 
     except Exception as e:
-        error_msg = f"Error processing {diff_file}: {str(e)}"
-        console.print(f"[bold red]{error_msg}")
-        return error_msg
-
-
-# =============== Main Function ===============
-
-
-def analyze_git_changes(
-    model_name: str,
-    commit_hash: Optional[str] = None,
-    output_dir: str = "temp_diffs",
-    system_prompt: str = None,
-) -> None:
-    """
-    Analyze git changes using the specified model and output each file's analysis directly
-
-    Args:
-        model_name (str): Name of the Ollama model to use
-        commit_hash (Optional[str]): Commit hash to analyze, or None for uncommitted changes
-        output_dir (str): Directory to store diff files
-        system_prompt (str, optional): Custom system prompt for the LLM
-
-    Returns:
-        None
-    """
-    # Export git diffs
-    console.print(
-        Panel.fit(f"[bold cyan]Step 1: Exporting Git Diffs", border_style="cyan")
-    )
-    diff_files = export_git_diffs(commit_hash, output_dir)
-
-    if not diff_files:
-        console.print("[yellow]No diff files were generated. Nothing to analyze.")
-        return
-
-    # Analyze each diff file
-    console.print(
-        Panel.fit(
-            f"[bold cyan]Step 2: Analyzing {len(diff_files)} Diff Files",
-            border_style="cyan",
+        rprint(
+            f"[error]Error saving default model to config file {DEFAULT_CONFIG_FILE}: {e}[/error]"
         )
-    )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]Analyzing files..."),
-        transient=False,
-    ) as progress:
-        task = progress.add_task("", total=len(diff_files))
 
-        for i, diff_file in enumerate(diff_files):
-            progress.update(
-                task,
-                description=f"[bold blue]Analyzing file {i+1}/{len(diff_files)}: {os.path.basename(diff_file)}",
-            )
-            # Analyze and display result directly
-            analyze_diff_with_llm(model_name, diff_file, system_prompt)
-            progress.update(task, advance=1)
-
-    console.print("\n[bold green]Analysis complete!")
+# --- Main Application Logic ---
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Git Diff Analyzer with Ollama")
-    parser.add_argument("-m", "--model", help="Specify Ollama model name to use")
+    """
+    Main function to parse arguments, guide user interaction, and initiate
+    the Git diff analysis using Ollama. Includes logic for managing
+    a default Ollama model.
+    """
+    # --- 1. Argument Parsing ---
+    # Create a rich panel for the description
+    description_panel = Panel.fit(
+        "[bold blue]Analyze Git Changes with Ollama LLMs[/bold blue]\n"
+        "Export git diffs and send them to an Ollama model for analysis.",
+        title="[bold green]Description[/bold green]",
+        border_style="green",
+    )
+    
+    # Create a plain text description for the argparse (Rich formatting won't work in argparse)
+    description_str = "Analyze Git Changes with Ollama LLMs\nExport git diffs and send them to an Ollama model for analysis."
+    
+    parser = argparse.ArgumentParser(
+        description=description_str
+    )
+    
+    # Display the rich panel separately (this will show in the console but not affect argparse)
+    console.print(description_panel)
+    parser.add_argument(
+        "-m",
+        "--model",
+        help="Specify Ollama model name to use for this run. Overrides default.",
+        type=str,
+    )
     parser.add_argument(
         "-c",
         "--commit",
-        help="Specific commit hash to analyze (default: uncommitted changes)",
+        help="Specific commit hash to analyze. Defaults to uncommitted changes if not provided.",
+        type=str,
     )
     parser.add_argument(
         "--output",
         default="temp_diffs",
-        help="Output directory for diff files (default: temp_diffs)",
+        help="Output directory to save temporary diff files. Default: '%(default)s'",
+        type=str,
     )
     parser.add_argument(
-        "--threads", type=int, default=4, help="Number of parallel workers (default: 4)"
+        "--threads",
+        type=int,
+        default=4,
+        help="Number of parallel worker threads for generating diff files. Default: %(default)s",
     )
-    parser.add_argument("--prompt", help="Custom system prompt for the LLM")
+    parser.add_argument(
+        "--prompt",
+        help="Custom system prompt for the LLM analysis. Overrides the default system prompt.",
+        type=str,
+    )
+    # Add new argument to specifically set/change the default model
+    parser.add_argument(
+        "--set-default-model",
+        action="store_true",
+        help="Interactively select and save an Ollama model as the default.",
+    )
 
     args = parser.parse_args()
 
-    # Show header
-    console.print(
+    # --- 2. Welcome Header ---
+    rprint(
         Panel.fit(
             "[bold magenta]Git Diff Analyzer with Ollama[/bold magenta]\n"
             "[cyan]Tool for analyzing git changes using LLMs",
-            title="[bold green]Welcome",
+            title="[bold green]Welcome[/bold green]",
             border_style="green",
         )
     )
+    rprint("")  # Add a blank line for spacing
 
-    # Get models and display them
-    models = get_models()
-    display_models(models)
+    # --- 3. Ollama Model Management (Select/Set Default) ---
+    rprint("[bold]Checking available Ollama models...[/bold]")
+    models = get_models()  # Call the imported function
 
     if not models:
-        return
+        rprint(
+            Panel(
+                "[bold red]Error:[/bold red] No Ollama models found.\n"
+                "[yellow]Please ensure Ollama is running and models are downloaded.[/yellow]",
+                title="[bold red]Ollama Connection Error[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)  # Exit if no models are available
 
-    # Get commit hash if not provided
-    commit_hash = args.commit
-    if not commit_hash:
-        # Ask the user if they want to analyze a specific commit or uncommitted changes
-        console.print("\n[bold yellow]What would you like to analyze?")
-        console.print("[cyan]1. Current uncommitted changes")
-        console.print("[cyan]2. Specific git commit")
+    # If the user specifically requested to set the default model
+    if args.set_default_model:
+        rprint(Panel("[bold blue]⚙️ Set Default Ollama Model[/bold blue]", expand=False))
+        display_models(models)  # Show available models
+        rprint("\nPlease select a model to set as default:")
+        selected_model_for_default = select_model(models)  # Interactively select
+
+        if selected_model_for_default:
+            save_default_model(selected_model_for_default)  # Save the selection
+            rprint(
+                "\n[bold green]Configuration complete. You can now run the analyzer without specifying a model.[/bold green]"
+            )
+            sys.exit(0)  # Exit after setting the default
+        else:
+            rprint("\n[yellow]No model selected. Default model not changed.[/yellow]")
+            sys.exit(1)  # Exit indicating no model was selected
+
+    # If not setting default, proceed with analysis flow
+
+    # Determine the model to use for this analysis run
+    selected_model_for_analysis: Optional[str] = None
+
+    if args.model:
+        # User specified model via command line - prioritize this
+        selected_model_for_analysis = args.model
+        rprint(
+            f"[info]Using model specified via command line: [cyan]{selected_model_for_analysis}[/cyan][/info]"
+        )
+        # Optional: Validate if the specified model exists in the available list
+        # if not any(m['name'] == selected_model_for_analysis for m in models):
+        #     rprint(f"[error]Specified model '{selected_model_for_analysis}' not found among available models.[/error]")
+        #     selected_model_for_analysis = None # Force interactive selection or default loading
+
+    if selected_model_for_analysis is None:
+        # No model specified via command line, try loading default
+        default_model_name = load_default_model()
+
+        if default_model_name:
+            # Check if the loaded default model is actually available
+            if any(m["name"] == default_model_name for m in models):
+                selected_model_for_analysis = default_model_name
+                rprint(
+                    f"[info]Using default model from [dim]{DEFAULT_CONFIG_FILE}[/dim]: [cyan]{selected_model_for_analysis}[/cyan][/info]"
+                )
+            else:
+                rprint(
+                    f"[warning]Default model '[yellow]{default_model_name}[/yellow]' not found among available models. It might have been removed.[/warning]"
+                )
+                rprint("[info]Falling back to interactive model selection.[/info]")
+
+        if selected_model_for_analysis is None:
+            # If still no model (no cmd line arg, no valid default) - prompt user
+            rprint(
+                "\n[bold blue]📦 Select an Ollama Model for this analysis[/bold blue]"
+            )
+            display_models(models)  # Show models again before prompting
+            selected_model_for_analysis = select_model(models)  # Interactively select
+
+            if selected_model_for_analysis:
+                # Ask if they want to save this newly selected model as default
+                save_as_default = Confirm.ask(
+                    f"\n[bold cyan]Would you like to save '[cyan]{selected_model_for_analysis}[/cyan]' as the default model for future runs?[/bold cyan]",
+                    default=True,  # Suggest saving as default
+                )
+                if save_as_default:
+                    save_default_model(selected_model_for_analysis)
+            else:
+                rprint("\n[yellow]No model selected for analysis. Exiting.[/yellow]")
+                return  # Exit if model selection was cancelled/failed
+
+    # Final check before proceeding
+    if not selected_model_for_analysis:
+        # This case should ideally be caught by the checks above, but as a safeguard
+        rprint(
+            "[bold red]Fatal Error:[/bold red] No Ollama model could be determined for analysis. Exiting."
+        )
+        sys.exit(1)
+
+    rprint(
+        f"\n[bold green]✅ Proceeding with analysis using model:[/bold green] [cyan]{selected_model_for_analysis}[/cyan]"
+    )
+
+    # --- 4. Git Analysis Target Selection ---
+    target_commit_hash: Optional[str] = args.commit
+
+    if not target_commit_hash:
+        rprint("\n[bold blue]🔍 Choose Analysis Target[/bold blue]")
+        # Prompt user to choose between uncommitted changes and a specific commit
         choice = Prompt.ask(
-            "[bold cyan]Choose an option", choices=["1", "2"], default="1"
+            Text.from_markup(
+                "[bold cyan]Analyze:[/bold cyan] (1) Current uncommitted changes or (2) Specific commit?"
+            ),  # Use Text.from_markup for richer prompt
+            choices=["1", "2"],
+            default="1",
+            show_choices=True,
         )
 
         if choice == "2":
-            latest_commit = get_latest_commit_hash()
-            console.print(f"[cyan]Latest commit: {latest_commit}")
-            commit_hash = Prompt.ask(
-                "[bold cyan]Enter commit hash", default=latest_commit
+            latest_commit = get_latest_commit_hash()  # Call the imported function
+            if latest_commit:
+                rprint(
+                    f"[info]Latest commit hash: [yellow]{latest_commit[:8]}...[/yellow][/info]"
+                )
+            else:
+                rprint("[warning]Could not retrieve latest commit hash.[/warning]")
+
+            # Prompt for specific commit hash, offering latest as default if available
+            target_commit_hash = Prompt.ask(
+                "[bold cyan]Enter commit hash to analyze[/bold cyan]",
+                default=latest_commit if latest_commit else None,
             )
+            if not target_commit_hash:
+                rprint(
+                    "\n[yellow]No commit hash provided for analysis. Exiting.[/yellow]"
+                )
+                return  # Exit if user doesn't provide a commit hash
 
-    # Let user select a model
-    selected_model = args.model or select_model(models)
-    if not selected_model:
-        console.print("[yellow]Thank you for using the service")
-        return
+    analysis_target_desc = (
+        f"commit [yellow]{target_commit_hash[:8]}...[/yellow]"
+        if target_commit_hash
+        else "[yellow]current uncommitted changes[/yellow]"
+    )
+    rprint(f"\n[info]Analysis target set to: {analysis_target_desc}[/info]")
 
-    console.print(f"[bold green]Selected model: {selected_model}")
+    # --- 5. System Prompt Configuration ---
+    system_prompt_to_use: str = (
+        args.prompt if args.prompt is not None else SYSTEM_PROMPT
+    )
 
-    # Set default system prompt if not provided
-    system_prompt = args.prompt
-    if not system_prompt:
-        system_prompt = """Output format: markdown with filename as H1 heading, followed by bullet points of changes.
-        - List what was added, removed, or modified
-        - Note code structure changes, logic updates, bug fixes
-        - Be direct, factual, and concise
-        - No introductory or closing phrases
-        - No commentary about what you're doing
-        """
+    if args.prompt:
+        rprint("[info]Using custom system prompt.[/info]")
 
-    # Analyze git changes
-    analyze_git_changes(selected_model, commit_hash, args.output, system_prompt)
+    # --- 6. Initiate Analysis ---
+    rprint(
+        f"\n[bold blue]🧠 Starting Analysis with {selected_model_for_analysis}[/bold blue]"
+    )
+    rprint("-" * 80)  # Separator
 
-    console.print("\n[bold green]Analysis complete! Thank you for using the service!")
+    # Call the imported analysis function
+    analyze_git_changes(
+        model_name=selected_model_for_analysis,  # Use the determined model name
+        commit_hash=target_commit_hash,
+        output_dir=args.output,
+        system_prompt=system_prompt_to_use,
+        
+    )
+
+    rprint("-" * 80)  # Separator
+    rprint("\n[bold green]✅ Analysis process complete![/bold green]")
+    rprint("[blue]Thank you for using the Git Diff Analyzer.[/blue]")
 
 
+# --- Entry Point ---
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        console.print("\n[bold yellow]Operation cancelled")
-        sys.exit(0)
+        # Handle Ctrl+C gracefully
+        rprint("\n[bold yellow]✋ Operation cancelled by user.[/bold yellow]")
+        sys.exit(0)  # Exit cleanly
     except Exception as e:
-        console.print(f"\n[bold red]Unexpected error: {str(e)}")
-        sys.exit(1)
+        # Catch any other unexpected exceptions
+        rprint(
+            Panel(
+                f"[bold red]An unexpected error occurred:[/bold red]\n[yellow]{str(e)}[/yellow]",
+                title="[bold red]Fatal Error[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)  # Exit with an error code
